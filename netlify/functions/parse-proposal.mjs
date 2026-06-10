@@ -1,108 +1,151 @@
-// netlify/functions/parse-proposal.mjs
-// 보험 PDF(보장분석/가입현황 또는 가입제안서)를 받아 계약·담보를 구조화 추출.
-// GEMINI_API_KEY 는 Netlify 환경변수에만 둡니다(HTML 노출 금지).
+// netlify/functions/ai-parse.mjs
+// 보장분석 리포트 / 가입제안서 PDF를 Gemini로 구조화 추출하는 통합 프록시.
+// GEMINI_API_KEY 는 Netlify 환경변수에만 설정 (클라이언트 노출 금지).
+// mode: "report"   → 롯데 보장분석 리포트(분할된 페이지 묶음)에서 [별첨] 계약별 담보 추출
+// mode: "proposal" → 타사 가입제안서에서 담보 추출
+// 두 모드 모두 담보를 '표준 카테고리'로 매핑해 보험사 간 명칭 차이를 흡수한다.
 
-// 키가 접근 가능한 모델을 순서대로 시도 (앞이 실패/미지원이면 다음으로 자동 폴백)
-const MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"];
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
 
-const SCHEMA = {
+// 표준 담보 카테고리 — 프런트(index.html)의 GROUPS와 1:1 동기화 필수
+const CATEGORIES = [
+  "질병사망","상해사망",
+  "질병후유장해","상해후유장해",
+  "질병입원의료비","질병통원의료비","상해입원의료비","상해통원의료비",
+  "일반암진단비","유사암진단비","전이암진단비","암수술비","고액암치료비","암입원·통원·기타",
+  "뇌혈관질환진단비","뇌졸중진단비","뇌출혈진단비","뇌혈관질환수술비",
+  "허혈성심장질환진단비","급성심근경색진단비","심장질환수술비",
+  "질병수술비","상해수술비","종수술비(1~5종)","특정질병수술비",
+  "질병입원일당","상해입원일당","간병인사용지원",
+  "장기요양자금","치매진단비",
+  "교통사고처리지원금","변호사선임비용","벌금(대인)","벌금(대물)","자동차사고부상위로금",
+  "일상생활배상책임","골절진단비","깁스치료비","화재벌금","응급실내원비",
+  "기타"
+];
+
+const COV_ITEM = {
   type: "object",
   properties: {
-    documentType: { type: "string", description: "analysis(보장분석/가입현황·기존계약 여러건) 또는 proposal(가입제안서·신규)" },
-    customer: {
-      type: "object",
-      properties: { name: { type: "string" }, cert: { type: "string", description: "생년월일/증권 식별 일부" } }
-    },
+    name:     { type: "string",  description: "담보명 원문(순번·고지구분 접두어 제거)" },
+    category: { type: "string",  enum: CATEGORIES, description: "표준 카테고리. 명칭이 달라도 의미가 가장 가까운 항목으로 매핑, 없으면 '기타'" },
+    amt:      { type: "integer", description: "가입금액(만원 단위 정수)" }
+  },
+  required: ["name", "category", "amt"]
+};
+
+const REPORT_SCHEMA = {
+  type: "object",
+  properties: {
     contracts: {
       type: "array",
-      description: "계약(또는 제안 상품) 목록. 보장분석이면 보유계약 전부, 제안서면 1건.",
       items: {
         type: "object",
         properties: {
-          insurer:        { type: "string",  description: "보험사명 (예: DB손해보험, 한화손보, NH농협손보, 메리츠화재, 롯데손해보험)" },
-          product:        { type: "string",  description: "상품명" },
-          monthlyPremium: { type: "integer", description: "월 보험료(원)" },
-          totalPremium:   { type: "integer", description: "총 납입보험료(원), 없으면 0" },
-          contractDate:   { type: "string",  description: "계약일 YYYY.MM.DD, 제안서면 빈 문자열" },
-          payYears:       { type: "integer", description: "납입 년수" },
-          term:           { type: "string",  description: "보장만기 (예: 100세만기, 종신)" },
-          covs: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                name: { type: "string",  description: "담보명" },
-                amt:  { type: "integer", description: "가입금액(만원 단위 정수)" }
-              },
-              required: ["name", "amt"]
-            }
-          }
+          insurer:        { type: "string",  description: "보험사명 (예: 롯데손해보험, DB손해보험, NH농협손해보험, KB손해보험, 메리츠화재, 삼성화재, 현대해상, 한화손해보험)" },
+          productName:    { type: "string",  description: "보험서비스(상품)명" },
+          monthlyPremium: { type: "integer", description: "보험료(원). 페이지 상단 헤더의 숫자" },
+          payProgress:    { type: "string",  description: "납입횟수 (예: 41/240)" },
+          period:         { type: "string",  description: "보장기간 (예: 2023.01.10~2043.01.10)" },
+          covs:           { type: "array", items: COV_ITEM }
         },
-        required: ["insurer", "product", "covs"]
+        required: ["insurer", "productName", "covs"]
       }
     }
   },
-  required: ["documentType", "contracts"]
+  required: ["contracts"]
 };
 
-const PROMPT = `이 PDF는 한국 손해보험/생명보험 문서입니다. 두 종류 중 하나입니다.
-(1) 보장분석·가입현황·증권요약: 고객이 이미 가입한 '여러 기존계약'이 나열됨 → documentType="analysis", contracts에 각 계약을 모두.
-(2) 가입제안서: 새로 권유하는 '신규 상품 1건' → documentType="proposal", contracts에 1건.
+const PROPOSAL_SCHEMA = {
+  type: "object",
+  properties: {
+    insurer:        { type: "string" },
+    productName:    { type: "string" },
+    monthlyPremium: { type: "integer", description: "월 보장보험료(원)" },
+    payYears:       { type: "integer", description: "납입 년수" },
+    term:           { type: "string",  description: "보장만기 (예: 100세만기)" },
+    covs:           { type: "array", items: COV_ITEM }
+  },
+  required: ["insurer", "covs"]
+};
 
-각 계약/상품마다 추출:
-- insurer(보험사명), product(상품명), monthlyPremium(월보험료 원), totalPremium(총납입 원, 없으면 0),
-  contractDate(계약일, 제안서면 ""), payYears(납입년수 정수), term(보장만기 텍스트),
-- covs: 담보(특약) 목록 [{name, amt}]
+const MAPPING_RULES = `
+[표준 카테고리 매핑 규칙 — 보험사마다 명칭이 달라도 의미로 매핑]
+- '유사암'에는 제자리암·경계성종양·갑상선암·기타피부암·소액암이 포함됨 → 유사암진단비
+- '뇌혈관질환'은 뇌졸중·뇌출혈을 포괄하는 상위 개념. '뇌졸중'은 뇌졸중진단비, '뇌출혈'은 뇌출혈진단비로 각각 구분
+- '허혈성심장질환'은 급성심근경색을 포괄. '급성심근경색'만 명시되면 급성심근경색진단비
+- 1~5종 / 1~7종 수술비, N종수술비 → 종수술비(1~5종)
+- 특정질병·N대질병 수술비 → 특정질병수술비
+- 후유장해 3%·3~100%·80%이상 모두 → 질병/상해 후유장해
+- 표적항암약물치료비·항암방사선약물치료비·세기조절방사선·다빈치로봇 등 고액 암치료 → 고액암치료비
+- 암직접치료입원일당·암통원·항암통원 → 암입원·통원·기타
+- 운전자 관련: 교통사고처리지원금(형사합의금 포함), 변호사선임비용, 벌금(대인/대물 구분), 자동차사고부상위로금(부상치료비)
+- 간병인사용·간병인지원 입원일당 → 간병인사용지원
+- 일상생활중배상책임·가족일상생활배상책임 → 일상생활배상책임
+- 위에 없는 담보(여행자·치아·운전자휴업 등)는 '기타'
+[금액 규칙]
+- 가입금액은 반드시 '만원' 단위 정수: 1억원=10000, 3억=30000, 5천만원=5000, 5백만원=500, 30만원=30, "101,135만원"=101135
+- 일당류(입원일당 등)는 표기된 만원 금액 그대로 (예: 3만원=3)
+- 가입금액 0 또는 '-' 인 담보는 제외
+[공통 제외]
+- 보험료납입면제·납입지원 등 행정성 담보, 소계/합계 행 제외
+- 담보명 앞 순번·'(건강고지)'·'(간편고지)' 접두어 제거 (단 '116대질병'처럼 명칭 일부인 숫자는 보존)`;
 
-규칙:
-- amt는 반드시 '만원' 단위 정수로 변환: 1억원=10000, 5천만원=5000, 5백만원=500, 1천만원=1000, 2천만원=2000, 10만원=10, "101,135만원"=101135.
-- 가입금액이 '원' 단위로 적혀 있으면 만원으로 환산(10,000,000원=1000).
-- '보험료납입면제대상', '보험료납입지원' 같은 행정성 담보는 제외.
-- 소계/합계 행은 제외. 담보명 앞 '(건강고지)'·'(간편고지)'·순번은 제거하되 '116대질병'처럼 숫자가 담보명 일부면 보존.
-- 같은 담보가 여러 줄(소계)로 나뉘면 대표(총액) 한 줄만.
-- 보장분석 문서에서 계약별 담보가 별첨/상세 페이지에 있으면 그 페이지까지 읽어 계약에 매칭.
-오직 스키마에 맞는 JSON으로만 응답.`;
+const REPORT_PROMPT = `이 PDF는 한국 손해보험사의 '보장분석 리포트' 중 일부 페이지 묶음입니다.
+'[별첨] 보험서비스(상품)별 보장 현황' 형식의 페이지에서만 계약 정보를 추출하세요. 별첨 페이지 1장 = 계약 1건입니다.
+표지·요약(보유계약 현황)·한장보장현황·세부가입현황·안내 및 유의사항 페이지는 모두 무시하세요.
+각 별첨 페이지에서: 보험사명, 상품명, 보험료(원), 납입횟수(예: 41/240), 보장기간, 그리고 담보 표의 모든 (담보명, 가입금액)을 추출합니다.
+페이지 상단 헤더에 작게 표기된 납입정보/보험료/기간을 정확히 읽으세요. 보험사명이 페이지에 없으면 상품명으로 추정하세요(let: 계열=롯데손해보험).
+${MAPPING_RULES}
+오직 JSON으로만 응답.`;
 
-async function callModel(model, pdfBase64, apiKey) {
-  const body = {
-    contents: [{ parts: [
-      { inline_data: { mime_type: "application/pdf", data: pdfBase64 } },
-      { text: PROMPT }
-    ]}],
-    generationConfig: { responseMimeType: "application/json", responseSchema: SCHEMA, temperature: 0 }
-  };
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    { method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify(body) }
-  );
-  const txt = await r.text();
-  return { ok: r.ok, status: r.status, txt };
-}
+const PROPOSAL_PROMPT = `이 PDF는 한국 손해보험 '가입제안서'입니다. 담보(보장) 목록 표에서 각 담보명과 가입금액을 정확히 추출하세요.
+같은 담보가 여러 줄(소계)로 나뉘면 대표(총액) 한 줄만 남기세요.
+보험사명·상품명·월 보장보험료(원)·납입년수·보장만기도 함께 추출하세요.
+${MAPPING_RULES}
+오직 JSON으로만 응답.`;
+
+const json = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
 
 export default async (req) => {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return new Response(JSON.stringify({ error: "GEMINI_API_KEY 미설정" }), { status: 500 });
+  if (!process.env.GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY 미설정 (Netlify 환경변수 확인)" }, 500);
 
-  let pdfBase64;
-  try { ({ pdfBase64 } = await req.json()); } catch { return new Response("Bad Request", { status: 400 }); }
-  if (!pdfBase64) return new Response(JSON.stringify({ error: "pdfBase64 누락" }), { status: 400 });
+  let mode, pdfBase64;
+  try { ({ mode = "report", pdfBase64 } = await req.json()); }
+  catch { return json({ error: "잘못된 요청 본문" }, 400); }
+  if (!pdfBase64) return json({ error: "pdfBase64 누락" }, 400);
 
-  let lastErr = "";
-  for (const model of MODELS) {
-    try {
-      const { ok, status, txt } = await callModel(model, pdfBase64, apiKey);
-      if (ok) {
-        const data = JSON.parse(txt);
-        const out = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") || "{}";
-        return new Response(out.replace(/```json|```/g, "").trim(),
-          { headers: { "Content-Type": "application/json", "x-model-used": model } });
-      }
-      lastErr = `[${model}] ${status} ${txt}`;
-      if (!/not.?found|not supported|does not exist|PERMISSION|unavailable/i.test(txt)) break;
-    } catch (e) { lastErr = `[${model}] ${String(e)}`; }
+  const isReport = mode === "report";
+  const body = {
+    contents: [{ parts: [
+      { inline_data: { mime_type: "application/pdf", data: pdfBase64 } },
+      { text: isReport ? REPORT_PROMPT : PROPOSAL_PROMPT }
+    ]}],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: isReport ? REPORT_SCHEMA : PROPOSAL_SCHEMA,
+      temperature: 0
+    }
+  };
+
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+      { method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
+        body: JSON.stringify(body) }
+    );
+    if (!r.ok) {
+      const t = await r.text();
+      return json({ error: `Gemini 호출 실패 (${r.status})`, detail: t.slice(0, 500) }, 502);
+    }
+    const data = await r.json();
+    const text = (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("") || "{}";
+    const clean = text.replace(/```json|```/g, "").trim();
+    try { JSON.parse(clean); } catch { return json({ error: "AI 응답 파싱 실패", raw: clean.slice(0, 300) }, 502); }
+    return new Response(clean, { headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    return json({ error: String(e) }, 500);
   }
-  return new Response(JSON.stringify({ error: "Gemini 호출 실패", detail: lastErr }), { status: 502 });
 };
