@@ -122,7 +122,7 @@ footer.note{color:#9AA0A8; font-size:12px; margin-top:24px; line-height:1.6;}
 <div class="card" id="step1">
   <div class="step-tag">STEP 1</div>
   <h2>보장분석 리포트 PDF 업로드</h2>
-  <p class="desc">롯데손해보험 let: 보장분석 리포트 PDF를 올려주세요. 보유계약 리스트와 한장 보장현황을 자동으로 읽어옵니다.</p>
+  <p class="desc">보장분석/가입현황 PDF를 올려주세요. 보험사에 상관없이 보유계약과 담보·가입금액을 자동으로 읽어옵니다(AI 분석, 연결 전이면 롯데 형식 로컬 분석).</p>
   <div id="drop">
     <div class="big">PDF를 여기로 끌어오거나 클릭해서 선택</div>
     <div class="sm">고객 정보는 이 브라우저 안에서만 처리되며 외부로 전송되지 않습니다</div>
@@ -440,21 +440,69 @@ $('#drop').addEventListener('drop',e=>{e.preventDefault();$('#drop').classList.r
   if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);});
 $('#fileIn').addEventListener('change',e=>{if(e.target.files[0]) handleFile(e.target.files[0]);});
 
+/* AI 응답 정규화: 함수가 contracts[] 또는 단일(covs) 어느 형태로 줘도 통일 */
+function normCov(arr){return (arr||[]).map(v=>({name:String(v.name||'').trim(),amt:+v.amt||0})).filter(v=>v.name);}
+function aiContracts(g){
+  if(g&&Array.isArray(g.contracts)&&g.contracts.length)return g.contracts;
+  if(g&&Array.isArray(g.covs))return [{insurer:g.insurer,product:g.productName||g.name,
+    monthlyPremium:g.monthlyPremium||g.prem,totalPremium:g.totalPremium,
+    contractDate:g.contractDate,payYears:g.payYears,term:g.term,covs:g.covs}];
+  return [];
+}
+async function callParseAPI(file){
+  const b64=await fileToBase64(file);
+  const resp=await fetch(PROPOSAL_API,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({pdfBase64:b64})});
+  if(!resp.ok)throw new Error('api '+resp.status);
+  return resp.json();
+}
+
 async function handleFile(file){
   $('#parseStatus').style.display='block';
+  $('#parseStatus').textContent='보장분석 PDF 분석 중…';
+  let via='';
+  // 1) AI 우선
   try{
-    state.pages=await readPdf(file);
-    state.contracts=parseContracts(state.pages);
-    state.summary=parseSummary(state.pages);
-    state.selected=new Set(state.contracts.map((_,i)=>i));
-    $('#parseStatus').textContent=`완료 — 계약 ${state.contracts.length}건을 찾았습니다. 전체가 선택되어 있으니 뺄 계약만 해제하세요.`;
-    renderContractList();
-    $('#step2').classList.remove('hide');
-    $('#step2').scrollIntoView({behavior:'smooth'});
-  }catch(err){
-    console.error(err);
-    $('#parseStatus').textContent='PDF를 읽지 못했습니다. 파일을 다시 확인해주세요. ('+err.message+')';
+    const g=await callParseAPI(file);
+    const cs=aiContracts(g);
+    const mapped=cs.map(c=>({
+      insurer:c.insurer||'', name:c.product||c.name||'(상품)',
+      prem:+c.monthlyPremium||0, total:+c.totalPremium||0,
+      start:c.contractDate||'', end:c.term||'', payYears:c.payYears||null,
+      covs:normCov(c.covs)
+    })).filter(c=>c.covs.length||c.name!=='(상품)');
+    if(mapped.length){
+      state.pages=null;
+      state.contracts=mapped;
+      state.summary=mapped.flatMap(c=>c.covs);     /* 전(현재)=전 계약 담보 합산 */
+      via='AI';
+      const cust=g.customer||{};
+      if(cust.name&&!$('#custName').value)$('#custName').value=cust.name;
+      if(cust.cert&&!$('#certNo').value)$('#certNo').value=cust.cert;
+    }
+  }catch(err){/* 폴백 */}
+  // 2) 로컬 파서 폴백 (롯데 보장분석 형식)
+  if(via!=='AI'){
+    try{
+      state.pages=await readPdf(file);
+      state.contracts=parseContracts(state.pages);
+      state.summary=parseSummary(state.pages);
+      via='로컬';
+    }catch(err){
+      console.error(err);
+      $('#parseStatus').textContent='PDF를 읽지 못했습니다. 파일을 다시 확인해주세요. ('+err.message+')';
+      return;
+    }
   }
+  if(!state.contracts.length){
+    $('#parseStatus').textContent='계약을 찾지 못했습니다. 다른 PDF로 시도해보세요.';
+    return;
+  }
+  state.selected=new Set(state.contracts.map((_,i)=>i));
+  $('#parseStatus').innerHTML=`완료 — 계약 ${state.contracts.length}건을 찾았습니다 <span style="color:#8A8F98">(${via} 분석)</span>. 전체가 선택되어 있으니 뺄 계약만 해제하세요.`;
+  renderContractList();
+  $('#step2').classList.remove('hide');
+  $('#step2').scrollIntoView({behavior:'smooth'});
 }
 
 function renderContractList(){
@@ -517,28 +565,26 @@ function fileToBase64(file){return new Promise((res,rej)=>{const fr=new FileRead
   fr.onload=()=>res(String(fr.result).split(',')[1]);fr.onerror=rej;fr.readAsDataURL(file);});}
 async function handleProposalPdf(file){
   $('#pParseStatus').textContent='제안서 분석 중…';
-  let added=false, via='';
-  // 1) Gemini(서버 프록시) 우선
+  let added=0, via='';
+  // 1) AI 우선
   try{
-    const b64=await fileToBase64(file);
-    const resp=await fetch(PROPOSAL_API,{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({pdfBase64:b64})});
-    if(resp.ok){
-      const g=await resp.json();
-      const covs=(g.covs||[]).map(c=>({name:String(c.name||'').trim(),amt:+c.amt||0})).filter(c=>c.name);
+    const g=await callParseAPI(file);
+    aiContracts(g).forEach(c=>{
+      const covs=normCov(c.covs);
       if(covs.length){
-        state.proposals.push({insurer:g.insurer||'제안',name:g.productName||g.name||'(제안 상품)',
-          prem:+g.monthlyPremium||+g.prem||0,payYears:g.payYears||null,term:g.term||'',covs});
-        added=true; via='AI';
+        state.proposals.push({insurer:c.insurer||'제안',name:c.product||c.name||'(제안 상품)',
+          prem:+c.monthlyPremium||0,payYears:c.payYears||null,term:c.term||'',covs});
+        added++;
       }
-    }
-  }catch(err){/* 폴백으로 진행 */}
+    });
+    if(added)via='AI';
+  }catch(err){/* 폴백 */}
   // 2) 로컬 파서 폴백
   if(!added){
     try{
       const pages=await readPdf(file);
       const r=parseProposal(pages);
-      if(r.covs.length){state.proposals.push(r);added=true;via='로컬';}
+      if(r.covs.length){state.proposals.push(r);added=1;via='로컬';}
       else{
         $('#pParseStatus').innerHTML='⚠️ 담보를 읽지 못했습니다. 아래 칸에 직접 입력해 추가해주세요.';
         $('#pIns').value=r.insurer||''; $('#pName').value=r.name||''; $('#pPrem').value=r.prem?fmt(r.prem):'';
@@ -546,11 +592,9 @@ async function handleProposalPdf(file){
       }
     }catch(err){console.error(err);$('#pParseStatus').textContent='제안서 읽기 실패: '+err.message;return;}
   }
-  if(added){
-    const p=state.proposals[state.proposals.length-1];
-    renderProposals();
-    $('#pParseStatus').innerHTML=`✓ <b>${p.insurer}</b> · 담보 ${p.covs.length}건을 <b>신규 가입보험</b>으로 추가했습니다 <span style="color:#8A8F98">(${via} 분석)</span>. 잘못된 값은 비교표를 만든 뒤 칸을 눌러 고치면 됩니다.`;
-  }
+  renderProposals();
+  const last=state.proposals[state.proposals.length-1];
+  $('#pParseStatus').innerHTML=`✓ <b>${last.insurer}</b> 외 ${added}건을 <b>신규 가입보험</b>으로 추가했습니다 <span style="color:#8A8F98">(${via} 분석)</span>. 잘못된 값은 비교표를 만든 뒤 칸을 눌러 고치면 됩니다.`;
 }
 
 $('#selAllBtn').onclick=()=>{state.selected=new Set(state.contracts.map((_,i)=>i));renderContractList();};
@@ -678,11 +722,14 @@ function buildUnit(src,isProposal){
     let ins=src.insurer||INSURERS.find(k=>src.name.includes(k))||'';
     if(!ins){const t=SHORT.find(k=>src.name.includes(k)); if(t)ins=t.startsWith('NH')||t==='농협'?'NH농협손해':t;}
     col.insurer=ins||'보험사'; col.product=src.name; col.special=detectSpecial(src.name);
-    const endY=src.end.slice(0,4);
-    col.info=[fmt(src.prem)+'원',{text:fmt(src.total)+'원',em:true},src.start,
-      src.payYears?src.payYears+'년 납':'',(+endY>=2098?'종신':'~'+endY+'년')];
-    const found=findDetailPage(src);
-    if(found)for(const cv of coverageLines(found))covs.push(cv);
+    const endRaw=src.end||src.term||'';
+    let endDisp;
+    if(/종신/.test(endRaw))endDisp='종신';
+    else{const ey=(String(endRaw).match(/(\d{4})/)||[])[1]; endDisp=ey?(+ey>=2098?'종신':'~'+ey+'년'):(endRaw||'');}
+    col.info=[src.prem?fmt(src.prem)+'원':'',{text:src.total?fmt(src.total)+'원':'',em:true},src.start||'',
+      src.payYears?src.payYears+'년 납':'',endDisp];
+    if(src.covs&&src.covs.length){covs=src.covs.slice();}            /* AI가 준 담보 직접 사용 */
+    else{const found=findDetailPage(src); if(found)for(const cv of coverageLines(found))covs.push(cv);} /* 폴백: 별첨 상세 */
   }
   if(col.special){
     const arr=[];
