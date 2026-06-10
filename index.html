@@ -152,8 +152,14 @@ table.pv tr.sum td{background:var(--c-teal-bg-3);font-weight:800;}
 <!-- STEP 1 -->
 <div class="card">
   <span class="step-tag">STEP 1</span>
-  <h2>보장분석 리포트 업로드</h2>
-  <p class="desc">롯데 보장분석 리포트 PDF를 올리면 AI가 모든 보유계약의 담보를 보험사별로 자동 추출하고, 회사마다 다른 담보 명칭을 표준 분류로 정리합니다.</p>
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;">
+    <div>
+      <h2>보장분석 리포트 업로드</h2>
+      <p class="desc">롯데 보장분석 리포트 PDF를 올리면 AI가 모든 보유계약의 담보를 보험사별로 자동 추출하고, 회사마다 다른 담보 명칭을 표준 분류로 정리합니다.</p>
+    </div>
+    <button class="btn ghost sm" style="flex-shrink:0;" onclick="diagnose()">⚙ 연결 진단</button>
+  </div>
+  <div class="note" id="diagBox" style="display:none;margin:0 0 12px;"></div>
   <div class="drop" id="dropReport">
     <div class="big">보장분석 리포트 PDF를 끌어다 놓거나 클릭</div>
     <div class="sm">페이지를 자동 분할해 병렬 분석하므로 빠르고 안정적입니다 (최대 30MB)</div>
@@ -326,8 +332,11 @@ async function callAI(mode, pdfBase64, retry=1){
   try{
     const r = await fetch(API, {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({mode, pdfBase64})});
-    const j = await r.json();
-    if(!r.ok || j.error) throw new Error(j.error || ('HTTP ' + r.status));
+    const txt = await r.text();
+    let j;
+    try{ j = JSON.parse(txt); }
+    catch{ throw new Error(`서버 함수 응답 오류 (HTTP ${r.status}) — 함수가 배포되지 않았을 수 있습니다. Netlify Drop(드래그 배포)은 함수를 지원하지 않으므로 Git 또는 CLI로 배포해야 합니다.`); }
+    if(!r.ok || j.error) throw new Error((j.error||('HTTP '+r.status)) + (j.detail ? ' · ' + String(j.detail).slice(0,150) : ''));
     return j;
   }catch(e){
     if(retry > 0){ await new Promise(s=>setTimeout(s,1200)); return callAI(mode, pdfBase64, retry-1); }
@@ -384,7 +393,14 @@ async function handleReport(file){
     merged.sort((a,b)=>a._ord-b._ord);
 
     if(!merged.length){
-      prog('#progReport', 1, '계약을 찾지 못했습니다. 별첨 페이지가 포함된 보장분석 리포트인지 확인해주세요.');
+      if(fails.length === results.length){
+        // 모든 호출이 실패 → PDF 문제가 아니라 서버/키/모델 문제
+        prog('#progReport', 1, '⚠ 분석 서버 호출이 모두 실패했습니다 — ' + (fails[0].err.message||'알 수 없는 오류') + '  → 상단 [연결 진단] 버튼으로 원인을 확인하세요.');
+      } else if(fails.length){
+        prog('#progReport', 1, `⚠ 일부 구간(${fails.length}/${results.length}) 분석 실패: ${fails[0].err.message} — 나머지 구간에서도 계약을 찾지 못했습니다.`);
+      } else {
+        prog('#progReport', 1, '계약을 찾지 못했습니다. [별첨] 보험서비스(상품)별 보장 현황 페이지가 포함된 보장분석 리포트인지 확인해주세요.');
+      }
       return;
     }
     // 기존 report 계약 교체(재업로드 대응), 제안/수동은 유지
@@ -727,6 +743,38 @@ function addMatrixSlides(p){
       border:{type:'solid', color:C.LINE, pt:0.5}, rowH:0.22, fontFace:FONT,
       autoPage:true, autoPageRepeatHeader:true, newSlideStartY:1.22});
     s.addText('단위: 만원 (보험료는 원)', {x:10.4, y:7.05, w:2.5, h:0.3, fontSize:9, color:C.MUT, align:'right', fontFace:FONT});
+  }
+}
+
+/* ----- 연결 진단 ----- */
+async function diagnose(){
+  const box = $('#diagBox');
+  box.style.display = 'block';
+  box.innerHTML = '연결 상태 확인 중...';
+  try{
+    const r = await fetch(API, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mode:'ping'})});
+    const txt = await r.text();
+    let j;
+    try{ j = JSON.parse(txt); }
+    catch{
+      box.innerHTML = `<b style="color:var(--c-danger)">① 서버 함수 미배포 (HTTP ${r.status})</b><br>
+        /.netlify/functions/ai-parse 가 응답하지 않습니다.<br>
+        · <b>Netlify Drop(폴더 드래그)으로 올린 경우</b>가 가장 흔한 원인 — Drop은 서버 함수를 배포하지 않습니다.<br>
+        · Git 연동 또는 터미널에서 <code>netlify deploy --prod</code> 로 배포하고, 폴더에 <code>netlify.toml</code> 과 <code>netlify/functions/ai-parse.mjs</code> 가 포함됐는지 확인하세요.<br>
+        · 로컬에서 index.html 을 직접 연 경우에도 함수는 동작하지 않습니다 (배포된 주소에서 사용).`;
+      return;
+    }
+    if(j.ok){
+      box.innerHTML = `<b style="color:var(--c-success)">✓ 정상</b> — 함수 연결 OK · API 키 OK · 사용 모델: <b>${esc(j.model)}</b><br>이제 PDF를 업로드하면 분석됩니다.`;
+    } else if(j.step === 'env'){
+      box.innerHTML = `<b style="color:var(--c-danger)">② GEMINI_API_KEY 미설정</b><br>${esc(j.error)}<br>설정 후 <b>재배포(Redeploy)</b>해야 함수에 반영됩니다.`;
+    } else {
+      box.innerHTML = `<b style="color:var(--c-danger)">③ Gemini API 오류</b><br>${esc(j.error)}<br><span style="font-size:11.5px;color:var(--c-text-muted)">${esc(String(j.detail||'').slice(0,200))}</span><br>
+        · API 키가 유효한지(AI Studio에서 발급), 결제/쿼터 제한이 없는지 확인하세요.<br>
+        · 특정 모델만 쓰려면 환경변수 <code>GEMINI_MODEL</code> 로 지정할 수 있습니다.`;
+    }
+  }catch(e){
+    box.innerHTML = `<b style="color:var(--c-danger)">네트워크 오류</b> — ${esc(e.message)}`;
   }
 }
 
